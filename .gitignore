@@ -1,0 +1,36 @@
+# Models and SAEs (large files, downloaded separately)
+models/
+saes/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data
+data/*.jsonl
+data/*.npy
+data/*.bin
+
+# Results
+experiments/*/results/
+experiments/*/plots/
+*.png
+*.json
+!config.json
+
+# Environment
+.env
+**/.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
