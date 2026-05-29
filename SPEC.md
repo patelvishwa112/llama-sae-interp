@@ -59,22 +59,56 @@ Use EleutherAI's pre-trained TopK SAEs on Llama 3.2 1B Instruct to understand wh
 
 ### 3.2 What Anthropic's Circuit Tracing Tells Us (Claude 3.5 Haiku)
 
-Anthropic does NOT pre-select layers — they trace features across ALL layers and let the circuit emerge. But their findings reveal consistent patterns:
+From the **Circuit Tracing methods paper** (Anthropic, Mar 2025) — the most detailed source on which layers contain which types of features:
 
-| Behavioral Pattern | Layer Dynamics | Source |
-|-------------------|---------------|--------|
-| **Planning ahead** (rhyme) | Plan features activate in early-mid layers, THEN output is written toward them | Tracing Thoughts §2 |
-| **Hallucination** | Default refusal circuit spans mid-late layers. "Known entity" feature inhibits it at LATE layers | Tracing Thoughts §5 |
-| **Jailbreak** | Coherence pressure dominates mid-late layers. Safety features can't interrupt until sentence boundary | Tracing Thoughts §6 |
-| **Multi-step reasoning** | Intermediate concepts form in mid layers (Dallas→Texas) before answer features in late layers | Tracing Thoughts §7 |
-| **Unfaithful reasoning** | When bullshitting, late-layer features are absent despite plausible output text | Tracing Thoughts §4 |
+#### Anthropic's Feature Taxonomy by Layer
 
-**Key insight:** Behavioral circuits are not single-layer phenomena. They span multiple layers with competition between features. The most informative layers depend on the question:
-- **Is the model computing X?** → target mid-late layers where concepts form
-- **Why isn't X deployed?** → target the layers BETWEEN encoding peak and output
-- **Can we steer X?** → target the layer where the feature is most active AND causally connected to output
+Anthropic identifies FOUR distinct feature types, each with a specific layer distribution:
 
-### 3.3 What Anthropic's Feature Steering Tells Us (Claude 3 Sonnet)
+| Feature Type | Description | Layer Distribution | Example |
+|-------------|------------|-------------------|---------|
+| **Input features** | Represent low-level text properties (tokens, phrases) | Primarily **early** layers, but also present in mid/late | "digital" token feature |
+| **Abstract features** | Represent conceptual properties of context | **Middle and later** layers | "danger of mixing cleaning chemicals" |
+| **Functional features** | Perform computations, transform information | **Middle and later** layers | "add 9" feature that causes output = input + 9 |
+| **Output features** | Promote specific output tokens | **Late** layers | features that promote "the", "and", etc. |
+
+**This is the most explicit layer guidance Anthropic has published.** The paper states directly:
+
+> *"Input features...are common in early layers, and output features...are common in late layers."*
+> *"Features whose activations represent more abstract properties...appear in middle and later layers."*
+> *"Features that perform functions...tend to be found in middle and later layers."*
+
+#### Why Anthropic Replaces MLPs (and why our MLP SAEs are well-targeted)
+
+Anthropic's circuit tracing method uses **Cross-Layer Transcoders (CLTs)** that replace ALL MLP layers. Each CLT feature reads from the residual stream at one layer and contributes to all subsequent MLP outputs. The key insight:
+
+> *"We substitute a more interpretable component (a 'cross-layer transcoder') for the multi-layer perceptrons."*
+
+They replace MLPs — not attention — because **MLPs are where the interpretable computation lives.** Attention layers handle routing (which tokens to look at); MLPs handle transformation (what to do with that information). Our EleutherAI SAEs, trained on MLP outputs at every layer, are positioned exactly where Anthropic finds the most interpretable features.
+
+#### The Steering Plateau Effect
+
+A critical finding for our experiments: when Anthropic steered an "Analytics" feature, the effect **plateaued before layer 13 and then DECREASED toward the final layer.** This is because:
+- Features that promote an output (like "say an acronym") compete with each other
+- If you amplify only one feature, the other competing features dilute the effect in late layers
+- **Successful steering requires understanding the full circuit, not just one feature**
+
+This directly explains the ghost experiment's encoding-deployment gap: the probe finds the answer feature, but competing output-routing features in late layers override it.
+
+### 3.3 Community Findings: MLP vs Attention vs Residual Stream SAEs
+
+From independent replications and extensions of Anthropic's work:
+
+| SAE Type | Interpretability | Circuit Analysis Utility | Source |
+|----------|-----------------|------------------------|--------|
+| **Residual stream SAEs** | Highest interpretability in early-mid layers. Drops in late layers | Captures full information flow but features are mixtures of MLP+attention | OpenReview finding: "works less well for later model layers" |
+| **MLP output SAEs** (ours) | Good for functional and abstract features | "MLP layers are most relevant to computing a residual stream feature" | Alignment Forum: attention-output SAE paper |
+| **Attention output SAEs** | Also produce interpretable features | Reveal attention-level features that MLP SAEs miss | LessWrong: "Sparse Autoencoders Work on Attention Layer Outputs" |
+| **Cross-Layer Transcoders** (Anthropic) | Best for circuit tracing | Reads from residual at one layer, writes to ALL subsequent MLPs | Circuit Tracing methods paper |
+
+**Key limitation of our MLP-only SAEs:** We cannot trace attention-level features (induction heads, copy patterns, token-position routing). For experiments #2 (refusal circuit) and #4 (override tracing), attention-level features may be crucial — refusal might be an attention pattern, not an MLP computation. Mitigation: focus on experiments where MLP features are most informative (#1 gap closure, #3 persona steering).
+
+### 3.4 What Anthropic's Feature Steering Tells Us (Claude 3 Sonnet)
 
 | Finding | Layer Implication |
 |---------|------------------|
@@ -83,17 +117,17 @@ Anthropic does NOT pre-select layers — they trace features across ALL layers a
 | Neutrality feature reduces bias across ALL 9 dimensions | Some features have broad, beneficial effects — finding analogous features in Llama 3.2 is high-value |
 | Feature activation context ≠ resulting behavior | Don't trust what a feature fires on to predict what steering it will do. Test causally |
 
-### 3.4 Layer Targeting Strategy for Llama 3.2 1B (16 layers)
+### 3.5 Layer Targeting Strategy for Llama 3.2 1B (16 layers)
 
 Mapping from Qwen 0.5B (24 layers) to Llama 3.2 1B (16 layers), approximate scale factor ~0.67:
 
-| Llama Layer | Equivalent Qwen Range | Expected Content | Priority |
-|------------|----------------------|------------------|----------|
-| **L0-4** | Early (0-7) | Token/syntax features | P4 (future) |
-| **L5-8** | Mid-early (8-13) | Semantic composition, entity binding | P3 |
-| **L9-10** | Mid (~14) | **Persona formation** (equivalent to L14 peak) | **HIGH — Exp #3** |
-| **L11-13** | Late-mid (17-21) | **Factual encoding** (equivalent to L20-21) | **HIGHEST — Exp #1, #2** |
-| **L14-15** | Late (22-24) | **Output routing**, deployment decision | **HIGH — Exp #4** |
+| Llama Layer | Anthropic Feature Type | Equivalent Qwen Range | Expected Content | Priority |
+|------------|----------------------|----------------------|------------------|----------|
+| **L0-4** | Input features (token-level) | Early (0-7) | Token/syntax, local patterns | P4 (future) |
+| **L5-8** | Abstract features begin | Mid-early (8-13) | Semantic composition, entity binding, concepts | P3 |
+| **L9-10** | Abstract + Functional features | Mid (~14) | **Persona formation, abstract concepts** (≈L14 peak) | **HIGH — Exp #3** |
+| **L11-13** | Functional features dominate | Late-mid (17-21) | **Factual computation, functional transformations** (≈L20-21) | **HIGHEST — Exp #1, #2** |
+| **L14-15** | Output features dominate | Late (22-24) | **Output routing, token promotion, deployment** (≈L23-24) | **HIGH — Exp #4** |
 
 **For the first experiment (#1 — Gap Closure), we target L11-13** where the factual encoding-deployment gap is expected to peak. Then expand outward.
 
