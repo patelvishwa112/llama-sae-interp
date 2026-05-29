@@ -39,15 +39,15 @@ class TopKSAE:
             for key in f.keys():
                 weights[key] = f.get_tensor(key)
 
-        # SAE weight matrices
-        # W_enc: [d_model, num_latents] — encoder
+        # SAE weight matrices (stored as [n_latents, d_model] in safetensors)
+        # W_enc: [d_model, num_latents] — encoder (transposed from stored)
         # W_dec: [num_latents, d_model] — decoder (column-normalized)
         # b_dec: [d_model] — decoder bias (also used as pre-encoder bias)
         # b_enc: [num_latents] — encoder bias
-        self.W_enc = mx.array(weights["encoder.weight"].T)  # transpose to [d_model, n_latents]
-        self.W_dec = mx.array(weights["decoder.weight"])     # [n_latents, d_model]
+        self.W_enc = mx.array(weights["encoder.weight"].T)  # [n_latents, d_model] -> [d_model, n_latents]
+        self.W_dec = mx.array(weights["W_dec"])              # [n_latents, d_model]
         self.b_enc = mx.array(weights["encoder.bias"])       # [n_latents]
-        self.b_dec = mx.array(weights["decoder.bias"])       # [d_model]
+        self.b_dec = mx.array(weights["b_dec"])              # [d_model]
 
         self.d_model = self.W_enc.shape[0]
 
@@ -69,14 +69,15 @@ class TopKSAE:
         # Encoder: latents = x_centered @ W_enc + b_enc
         latents = x_centered @ self.W_enc + self.b_enc  # [batch, n_latents]
 
-        # TopK activation
-        top_vals, top_idx = mx.linalg.topk(latents, k=self.k, axis=-1)
+        # TopK activation (mx.topk returns values only in MLX 0.31, use argsort)
+        top_idx = mx.argsort(latents, axis=-1)[:, -self.k:]  # [batch, k] — indices of top k
+        # Gather top values
+        batch_indices = mx.arange(latents.shape[0])[:, None]
+        top_vals = latents[batch_indices, top_idx]  # [batch, k]
 
-        # Create sparse mask
-        batch_size = x.shape[0]
-        features = mx.zeros((batch_size, self.num_latents))
-        batch_indices = mx.arange(batch_size)[:, None]
-        features = features.at[batch_indices, top_idx].set(top_vals)
+        # Create sparse mask (init zeros, then add values at TopK indices)
+        features = mx.zeros((latents.shape[0], self.num_latents))
+        features = features.at[batch_indices, top_idx].add(top_vals)
 
         if features.shape[0] == 1:
             features = features[0]
@@ -119,8 +120,19 @@ class TopKSAE:
         if features.ndim == 2:
             features = features[0]
 
-        vals, idxs = mx.linalg.topk(features, k=min(top_n, self.k), axis=-1)
-        return [(int(i), float(v)) for i, v in zip(idxs.tolist(), vals.tolist())]
+        # Get top-k indices among active features (the only nonzero ones)
+        nonzero_mask = features > 0
+        n_nonzero = int(nonzero_mask.sum())
+        if n_nonzero == 0:
+            return []
+
+        actual_n = min(top_n, n_nonzero)
+        # argsort descending: sort indices by feature value
+        sort_idx = mx.argsort(features, axis=-1)[::-1]
+        top_feat_idx = sort_idx[:actual_n]
+        top_feat_vals = features[top_feat_idx]
+
+        return [(int(i), float(v)) for i, v in zip(top_feat_idx.tolist(), top_feat_vals.tolist())]
 
     def __repr__(self):
         return f"TopKSAE(layer={self.layer_idx}, d_model={self.d_model}, n_latents={self.num_latents}, k={self.k})"
