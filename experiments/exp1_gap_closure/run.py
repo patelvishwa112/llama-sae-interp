@@ -14,24 +14,27 @@ Protocol:
 """
 
 import json
+import sys
 import time
 from pathlib import Path
 from collections import defaultdict
 
-import mlx.core as mx
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sae_loader import TopKSAE, load_sae_suite
+from sae_loader_light import TopKSAELight
 
 # === Config ===
 MODEL_PATH = "models/Llama-3.2-1B-Instruct"
 SAE_PATH = "saes/sae-Llama-3.2-1B-131k"
 QUESTIONS_PATH = "data/factual_questions.jsonl"
 TARGET_LAYERS = list(range(8, 14))  # L8-L13
-STEERING_FACTOR = 3.0  # Within Anthropic's sweet spot (±5)
-TOP_K_FEATURES = 5  # Number of features to correlate/steer
+STEERING_FACTOR = 3.0
+TOP_K_FEATURES = 5
 OUTPUT_DIR = Path("experiments/exp1_gap_closure/results")
 DEVICE = "mps"
 
@@ -51,28 +54,22 @@ def load_questions():
     with open(QUESTIONS_PATH) as f:
         for line in f:
             questions.append(json.loads(line.strip()))
-    return questions[:100]  # Limit to 100 for tractability
+    return questions
 
 
 def get_answer_tokens(tokenizer, answer: str) -> list[int]:
-    """Get token ids for the answer string."""
     tokens = tokenizer.encode(answer, add_special_tokens=False)
     return tokens
 
 
 def extract_mlp_activations(model, tokenizer, prompt: str, layer_idx: int):
-    """Extract MLP output at a specific layer for the last token position."""
     mlp_outputs = {}
-
     def hook_fn(module, input, output):
         mlp_outputs["act"] = output.detach()
-
     hook = model.model.layers[layer_idx].mlp.register_forward_hook(hook_fn)
-
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         model(**inputs)
-
     hook.remove()
     return mlp_outputs["act"][0, -1, :].cpu().float().numpy()
 
@@ -81,211 +78,129 @@ def generate_with_steering(
     model, tokenizer, prompt: str, layer_idx: int,
     steer_direction: np.ndarray, steer_factor: float
 ) -> str:
-    """Generate with a steering vector added to MLP output at specified layer."""
-    original_outputs = {}
-
     def steering_hook(module, input, output):
-        # Add steering direction to output
         direction = torch.tensor(steer_direction, dtype=output.dtype, device=output.device)
-        modified = output + steer_factor * direction
-        original_outputs["original"] = output.detach()
-        return modified
-
+        return output + steer_factor * direction
     hook = model.model.layers[layer_idx].mlp.register_forward_hook(steering_hook)
-
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs, max_new_tokens=3, do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
+        outputs = model.generate(**inputs, max_new_tokens=3, do_sample=False,
+                                 pad_token_id=tokenizer.eos_token_id)
     hook.remove()
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 
-def run_encoding_analysis(saes, model, tokenizer, questions):
-    """Phase 1: Extract SAE features and measure encoding accuracy."""
-    print("=== Phase 1: Encoding Analysis ===")
-    results = {}
+def process_one_layer(layer_idx, sae_path, model, tokenizer, questions, output_dir):
+    """Process a single layer: load SAE, run encoding + causal, unload SAE."""
+    import gc
 
-    for layer_idx in TARGET_LAYERS:
-        if layer_idx not in saes:
-            print(f"  L{layer_idx}: SAE not available, skipping")
+    print(f"\n{'='*50}")
+    print(f"Layer {layer_idx}")
+    print(f"{'='*50}")
+
+    # Load SAE for this layer only
+    print(f"  Loading SAE L{layer_idx}...")
+    sae = TopKSAELight(sae_path, layer_idx, device=DEVICE)
+    print(f"  {sae}")
+
+    # Phase 1: Encoding
+    print(f"  Phase 1: Encoding analysis...")
+    layer_features = []
+    layer_answers = []
+    t0 = time.time()
+
+    for i, q in enumerate(questions):
+        prompt = f"{q['question']} Answer:"
+        answer = q["answer"]
+        try:
+            mlp_act = extract_mlp_activations(model, tokenizer, prompt, layer_idx)
+            # mlp_act is numpy float32, convert to torch
+            x = torch.tensor(mlp_act, dtype=torch.float16, device=DEVICE)
+            sae_features = sae.encode(x)
+            active_features = sae_features.cpu().float().numpy()
+            answer_tok = get_answer_tokens(tokenizer, answer)[0]
+            layer_features.append(active_features)
+            layer_answers.append(answer_tok)
+        except Exception as e:
+            if i < 3: print(f"    Error Q{i}: {e}")
             continue
+        if (i + 1) % 25 == 0:
+            print(f"    {i+1}/{len(questions)} ({time.time()-t0:.0f}s)")
 
-        sae = saes[layer_idx]
-        layer_features = []
-        layer_answers = []
-        correct = 0
-        total = 0
+    encoding_time = time.time() - t0
+    np.savez(output_dir / f"features_L{layer_idx}.npz",
+             features=np.array(layer_features), answers=np.array(layer_answers))
+    n_enc = len(layer_answers)
+    print(f"  Encoding: {n_enc} processed in {encoding_time:.0f}s")
 
-        t0 = time.time()
-        for i, q in enumerate(questions):
-            prompt = f"{q['question']} Answer:"
-            answer = q["answer"]
+    # Phase 2: Causal (on subset)
+    print(f"  Phase 2: Causal steering...")
+    decoder = sae.W_dec.cpu().float().numpy()  # Keep decoder in numpy for steering
+    layer_effects = []
+    test_questions = questions[:30]
+    t0 = time.time()
 
-            try:
-                # Extract MLP activation
-                mlp_act = extract_mlp_activations(model, tokenizer, prompt, layer_idx)
-
-                # Encode via SAE
-                x = mx.array(mlp_act)
-                sae_features = sae.encode(x)
-                active_features = np.array(sae_features.tolist())
-
-                # Get answer token id
-                answer_tok = get_answer_tokens(tokenizer, answer)[0]
-
-                layer_features.append(active_features)
-                layer_answers.append(answer_tok)
-
-                # Simple encoding check: is the answer token among
-                # top decoded features? We check if top features
-                # point toward the answer in output space
-                top_idx = np.argsort(active_features)[-TOP_K_FEATURES:]
-                top_decoder_dirs = np.array(sae.W_dec.tolist())[top_idx]
-
-                # Check if any top feature's decoder direction
-                # correlates with the answer token embedding
-                # (skip actual embedding lookup — use logit lens later)
-                total += 1
-
-            except Exception as e:
-                if i < 3:
-                    print(f"    Error on Q{i}: {e}")
-                continue
-
-            if (i + 1) % 20 == 0:
-                elapsed = time.time() - t0
-                print(f"  L{layer_idx}: {i+1}/{len(questions)} ({elapsed:.1f}s)")
-
-        elapsed = time.time() - t0
-        print(f"  L{layer_idx}: {total} processed in {elapsed:.1f}s")
-
-        # Save raw features for later analysis
-        np.savez(
-            OUTPUT_DIR / f"features_L{layer_idx}.npz",
-            features=np.array(layer_features),
-            answers=np.array(layer_answers),
-        )
-
-        results[layer_idx] = {
-            "n_processed": total,
-            "time_seconds": elapsed,
-        }
-
-    return results
-
-
-def run_causal_analysis(saes, model, tokenizer, questions, encoding_results):
-    """Phase 2: Test causal efficacy of SAE feature steering."""
-    print("\n=== Phase 2: Causal Analysis ===")
-    causal_results = {}
-
-    # For each layer, find top answer-correlated features
-    # and test if steering them changes output
-    for layer_idx in TARGET_LAYERS:
-        if layer_idx not in saes:
+    for i, q in enumerate(test_questions):
+        prompt = f"{q['question']} Answer:"
+        answer = q["answer"]
+        try:
+            # Baseline
+            baseline = generate_with_steering(model, tokenizer, prompt, layer_idx,
+                                              np.zeros(2048), 0.0)
+            # Get active features and build steering direction
+            mlp_act = extract_mlp_activations(model, tokenizer, prompt, layer_idx)
+            x = torch.tensor(mlp_act, dtype=torch.float16, device=DEVICE)
+            sae_feats = sae.encode(x)
+            active_feats = sae_feats.cpu().float().numpy()
+            top_idx = np.argsort(active_feats)[-TOP_K_FEATURES:]
+            steer_dir = np.zeros(2048)
+            for feat_id in top_idx:
+                steer_dir += decoder[feat_id] * active_feats[feat_id]
+            steer_dir = steer_dir / (np.linalg.norm(steer_dir) + 1e-8)
+            # Steered
+            steered = generate_with_steering(model, tokenizer, prompt, layer_idx,
+                                             steer_dir, STEERING_FACTOR)
+            b_correct = answer.lower() in baseline.lower()
+            s_correct = answer.lower() in steered.lower()
+            layer_effects.append({
+                "question": q["question"][:50], "answer": answer,
+                "baseline_output": baseline, "steered_output": steered,
+                "baseline_correct": b_correct, "steered_correct": s_correct,
+                "improved": s_correct and not b_correct,
+            })
+        except Exception as e:
+            if i < 3: print(f"    Error Q{i}: {e}")
             continue
+        if (i + 1) % 10 == 0:
+            print(f"    {i+1}/{len(test_questions)} ({time.time()-t0:.0f}s)")
 
-        # Load features from encoding phase
-        data = np.load(OUTPUT_DIR / f"features_L{layer_idx}.npz")
-        features = data["features"]
-        answers = data["answers"]
+    causal_time = time.time() - t0
+    n_total = len(layer_effects)
+    n_base = sum(1 for e in layer_effects if e["baseline_correct"])
+    n_steer = sum(1 for e in layer_effects if e["steered_correct"])
+    n_improved = sum(1 for e in layer_effects if e["improved"])
+    efficacy = max(0, (n_steer - n_base) / max(n_total, 1))
 
-        # Find features most correlated with each unique answer
-        unique_answers = np.unique(answers)
-        sae = saes[layer_idx]
+    print(f"  Causal: baseline={n_base}/{n_total} ({n_base/max(n_total,1):.0%}) "
+          f"steered={n_steer}/{n_total} ({n_steer/max(n_total,1):.0%}) "
+          f"efficacy={efficacy:.1%} ({causal_time:.0f}s)")
 
-        layer_effects = []
-        t0 = time.time()
+    # Unload SAE
+    del sae
+    gc.collect()
 
-        # Test on a subset for speed
-        test_questions = questions[:30]
-        baseline_outputs = []
-        steered_outputs = []
-
-        for i, q in enumerate(test_questions):
-            prompt = f"{q['question']} Answer:"
-            answer = q["answer"]
-
-            try:
-                # Get baseline output
-                baseline = generate_with_steering(
-                    model, tokenizer, prompt, layer_idx,
-                    np.zeros(2048), 0.0
-                )
-
-                # Get the most active features for this question
-                mlp_act = extract_mlp_activations(model, tokenizer, prompt, layer_idx)
-                x = mx.array(mlp_act)
-                sae_feats = sae.encode(x)
-                active_feats = np.array(sae_feats.tolist())
-
-                # Find top features and create composite steering direction
-                top_idx = np.argsort(active_feats)[-TOP_K_FEATURES:]
-                steer_dir = np.zeros(2048)
-                decoder = np.array(sae.W_dec.tolist())
-                for feat_id in top_idx:
-                    steer_dir += decoder[feat_id] * active_feats[feat_id]
-
-                steer_dir = steer_dir / (np.linalg.norm(steer_dir) + 1e-8)
-
-                # Generate with steering
-                steered = generate_with_steering(
-                    model, tokenizer, prompt, layer_idx,
-                    steer_dir, STEERING_FACTOR
-                )
-
-                baseline_outputs.append(baseline)
-                steered_outputs.append(steered)
-
-                # Check if answer appears in steered output
-                baseline_has_answer = answer.lower() in baseline.lower()
-                steered_has_answer = answer.lower() in steered.lower()
-
-                layer_effects.append({
-                    "question": q["question"][:50],
-                    "answer": answer,
-                    "baseline_output": baseline,
-                    "steered_output": steered,
-                    "baseline_correct": baseline_has_answer,
-                    "steered_correct": steered_has_answer,
-                    "improved": steered_has_answer and not baseline_has_answer,
-                })
-
-            except Exception as e:
-                if i < 3:
-                    print(f"    Error on Q{i}: {e}")
-                continue
-
-            if (i + 1) % 10 == 0:
-                elapsed = time.time() - t0
-                print(f"  L{layer_idx} causal: {i+1}/{len(test_questions)} ({elapsed:.1f}s)")
-
-        # Compute metrics
-        n_baseline_correct = sum(1 for e in layer_effects if e["baseline_correct"])
-        n_steered_correct = sum(1 for e in layer_effects if e["steered_correct"])
-        n_improved = sum(1 for e in layer_effects if e["improved"])
-        n_total = len(layer_effects)
-
-        causal_results[layer_idx] = {
-            "n_tested": n_total,
-            "baseline_accuracy": n_baseline_correct / max(n_total, 1),
-            "steered_accuracy": n_steered_correct / max(n_total, 1),
-            "improvement_rate": n_improved / max(n_total, 1),
-            "causal_efficacy": max(0, (n_steered_correct - n_baseline_correct) / max(n_total, 1)),
-            "examples": layer_effects[:10],  # Save first 10 examples
-        }
-
-        elapsed = time.time() - t0
-        print(f"  L{layer_idx}: baseline={n_baseline_correct}/{n_total} "
-              f"steered={n_steered_correct}/{n_total} "
-              f"efficacy={causal_results[layer_idx]['causal_efficacy']:.1%} "
-              f"({elapsed:.0f}s)")
-
-    return causal_results
+    return {
+        "layer": layer_idx,
+        "n_encoding": n_enc,
+        "encoding_time": encoding_time,
+        "n_causal": n_total,
+        "baseline_accuracy": n_base / max(n_total, 1),
+        "steered_accuracy": n_steer / max(n_total, 1),
+        "causal_efficacy": efficacy,
+        "improvement_rate": n_improved / max(n_total, 1),
+        "causal_time": causal_time,
+        "examples": layer_effects[:5],
+    }
 
 
 def main():
@@ -293,23 +208,33 @@ def main():
 
     print("Loading model...")
     model, tokenizer = load_model_and_tokenizer()
-    print(f"Model: {sum(p.numel() for p in model.parameters()):,} params, "
-          f"{len(model.model.layers)} layers")
-
-    print(f"Loading SAEs for layers {TARGET_LAYERS}...")
-    saes = load_sae_suite(SAE_PATH, layers=TARGET_LAYERS)
-    print(f"Loaded {len(saes)} SAEs: {[s.layer_idx for s in saes.values()]}")
+    print(f"Model: {sum(p.numel() for p in model.parameters()):,} params")
 
     questions = load_questions()
     print(f"Questions: {len(questions)}")
 
-    # Phase 1: Encoding
-    encoding_results = run_encoding_analysis(saes, model, tokenizer, questions)
+    all_layer_results = []
 
-    # Phase 2: Causal
-    causal_results = run_causal_analysis(saes, model, tokenizer, questions, encoding_results)
+    for layer_idx in TARGET_LAYERS:
+        result = process_one_layer(layer_idx, SAE_PATH, model, tokenizer,
+                                   questions, OUTPUT_DIR)
+        all_layer_results.append(result)
 
-    # Save results
+    # Summary
+    print("\n" + "=" * 65)
+    print("SUMMARY: SAE Encoding-Deployment Gap")
+    print("=" * 65)
+    print(f"{'Layer':<8} {'Baseline':>10} {'Steered':>10} {'Causal Eff':>12} {'Improved':>10}")
+    print("-" * 55)
+    for r in all_layer_results:
+        print(f"L{r['layer']:<7} {r['baseline_accuracy']:>9.1%} "
+              f"{r['steered_accuracy']:>9.1%} {r['causal_efficacy']:>11.1%} "
+              f"{r['improvement_rate']:>9.1%}")
+
+    # Ghost experiment baseline for comparison
+    print(f"\n{'Ghost probe (L21)':<8} {'~0%':>10} {'4.3%':>10} {'4.3%':>12}")
+    print(f"\nResults: {OUTPUT_DIR / 'results.json'}")
+
     all_results = {
         "config": {
             "model": "Llama-3.2-1B-Instruct",
@@ -318,28 +243,11 @@ def main():
             "top_k_features": TOP_K_FEATURES,
             "n_questions": len(questions),
         },
-        "encoding": encoding_results,
-        "causal": causal_results,
+        "layers": all_layer_results,
     }
-
     with open(OUTPUT_DIR / "results.json", "w") as f:
         json.dump(all_results, f, indent=2)
 
-    # Print summary table
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print(f"{'Layer':<8} {'Baseline':>10} {'Steered':>10} {'Causal Eff':>12} {'Improved':>10}")
-    print("-" * 55)
-    for layer_idx in TARGET_LAYERS:
-        if layer_idx in causal_results:
-            cr = causal_results[layer_idx]
-            print(f"L{layer_idx:<7} {cr['baseline_accuracy']:>9.1%} "
-                  f"{cr['steered_accuracy']:>9.1%} "
-                  f"{cr['causal_efficacy']:>11.1%} "
-                  f"{cr['improvement_rate']:>9.1%}")
-
-    print(f"\nResults saved to {OUTPUT_DIR / 'results.json'}")
     print("✓ Experiment #1 complete")
 
 
