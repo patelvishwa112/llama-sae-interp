@@ -31,25 +31,25 @@ Testing whether Sparse Autoencoder (SAE) features can causally steer language mo
 graph TB
     subgraph "Phase 1: Activation Capture (Model Only ~2.5GB)"
         M1[Llama 3.2 1B Model] -->|forward pass| A1[MLP Activations]
-        A1 -->|save| D1[(activations_L{N}.npz)]
+        A1 -->|save| D1[(activations_LN.npz)]
     end
 
     subgraph "Phase 2: SAE Encoding (SAE Only ~1GB)"
         D1 -->|load| E1[SAE Encoder]
         E1 -->|top-K=32 sparsify| F1[Feature Vectors]
-        F1 -->|save| D2[(features_L{N}.npz)]
+        F1 -->|save| D2[(features_LN.npz)]
     end
 
     subgraph "Phase 2c: DLA Steering (SAE + Embeddings ~1.5GB)"
         D2 -->|load| G1[SAE Decoder W_dec]
         H1[Token Embeddings] -->|dot product| G1
         G1 -->|DLA score per feature| I1[Top-5 Features]
-        I1 -->|compute steering| D3[(steering_dla_L{N}.npz)]
+        I1 -->|compute steering| D3[(steering_dla_LN.npz)]
     end
 
     subgraph "Phase 3: Direct Decoder Steering (Model + Vectors ~2.5GB)"
         M1 -->|forward pass| J1[Residual Stream at L12]
-        D4[W_dec feature vector] -->|add α · v| J1
+        D4[W_dec feature vector] -->|add alpha * v| J1
         J1 -->|autoregressive| K1[Steered Generation]
     end
 
@@ -293,7 +293,7 @@ flowchart LR
     end
 
     subgraph "✅ Direct Decoder (Works)"
-        A2[Residual Stream] -->|Add α · W_dec[f]| B2[Cleanly Amplified Direction]
+        A2[Residual Stream] -->|Add alpha * W_dec feature| B2[Cleanly Amplified Direction]
         B2 -->|Model routes naturally| C2[Behavior Change]
     end
 
