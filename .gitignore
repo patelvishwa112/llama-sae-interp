@@ -8,11 +8,6 @@ __pycache__/
 .venv/
 venv/
 
-# Data
-data/*.jsonl
-data/*.npy
-data/*.bin
-
 # Results
 experiments/*/results/
 experiments/*/plots/
