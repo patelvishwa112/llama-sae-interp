@@ -55,7 +55,7 @@ The hardest constraint was the 8GB RAM. Loading both the model (~2.5GB) and SAE 
 
 **The solution: a three-phase pipeline where the model and SAE never coexist in memory except for the final lightweight steering step.**
 
-![Architecture](architecture.html)
+[📐 Architecture diagram](architecture.html) — open in browser
 
 ### Phase 1: Activation Capture (Model Only, ~2.5GB)
 
